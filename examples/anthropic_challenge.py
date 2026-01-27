@@ -94,7 +94,117 @@ class VLIWRenderer(Renderer):
     # we left the fun parts to you
 
     print(f"rendering with {len(uops)} uops")
-    reg, inst = 0, []
+    
+    # Slot limits per engine
+    SLOT_LIMITS = {
+      "alu": 12,
+      "valu": 6,
+      "load": 2,
+      "store": 2,
+      "flow": 1,
+      "debug": 64
+    }
+    
+    def extract_regs(instr_tuple: tuple, engine: str) -> tuple[set[int], set[int]]:
+      """Extract read and write register sets from an instruction tuple."""
+      reads, writes = set(), set()
+      
+      if len(instr_tuple) == 0:
+        return reads, writes
+      
+      op = instr_tuple[0]
+      
+      if op == "const":
+        # ("const", dest, value)
+        dest = instr_tuple[1]
+        writes.add(dest)
+      elif op in ("load", "vload"):
+        # ("load"/"vload", dest, addr)
+        dest = instr_tuple[1]
+        addr = instr_tuple[2]
+        count = 8 if op == "vload" else 1
+        writes.update(range(dest, dest + count))
+        reads.add(addr)
+      elif op in ("store", "vstore"):
+        # ("store"/"vstore", addr, src)
+        addr = instr_tuple[1]
+        src = instr_tuple[2]
+        count = 8 if op == "vstore" else 1
+        reads.add(addr)
+        reads.update(range(src, src + count))
+      elif op == "vbroadcast":
+        # ("vbroadcast", dest, src)
+        dest = instr_tuple[1]
+        src = instr_tuple[2]
+        writes.update(range(dest, dest + 8))
+        reads.add(src)
+      elif op == "multiply_add":
+        # ("multiply_add", dest, a, b, c)
+        dest = instr_tuple[1]
+        a = instr_tuple[2]
+        b = instr_tuple[3]
+        c = instr_tuple[4]
+        writes.update(range(dest, dest + 8))
+        reads.update(range(a, a + 8))
+        reads.update(range(b, b + 8))
+        reads.update(range(c, c + 8))
+      elif op == "vselect":
+        # ("vselect", dest, cond, a, b)
+        dest = instr_tuple[1]
+        cond = instr_tuple[2]
+        a = instr_tuple[3]
+        b = instr_tuple[4]
+        writes.update(range(dest, dest + 8))
+        reads.update(range(cond, cond + 8))
+        reads.update(range(a, a + 8))
+        reads.update(range(b, b + 8))
+      elif op == "add_imm":
+        # ("add_imm", dest, src, imm)
+        dest = instr_tuple[1]
+        src = instr_tuple[2]
+        writes.add(dest)
+        reads.add(src)
+      elif op == "halt":
+        # ("halt",)
+        pass
+      else:
+        # Binary/ternary ops: (op, dest, src1, src2[, src3])
+        if len(instr_tuple) >= 3:
+          dest = instr_tuple[1]
+          count = 8 if engine == "valu" else 1
+          writes.update(range(dest, dest + count))
+          for i in range(2, len(instr_tuple)):
+            src = instr_tuple[i]
+            reads.update(range(src, src + count))
+      
+      return reads, writes
+    
+    def add_to_bundle(engine: str, instr_tuple: tuple):
+      """Add an instruction to the current bundle, flushing if necessary."""
+      nonlocal current_bundle, bundle_slots, bundle_writes
+      reads, writes = extract_regs(instr_tuple, engine)
+      
+      # Flush if slot full or hazards detected
+      if (bundle_slots[engine] >= SLOT_LIMITS[engine] or 
+          reads & bundle_writes or writes & bundle_writes):
+        if current_bundle:
+          bundles.append(current_bundle)
+        current_bundle = {}
+        bundle_slots = {e: 0 for e in SLOT_LIMITS}
+        bundle_writes = set()
+      
+      # Add to bundle
+      current_bundle.setdefault(engine, []).append(instr_tuple)
+      bundle_slots[engine] += 1
+      bundle_writes.update(writes)
+    
+    # Bundle state tracking
+    bundles = []  # List of instruction bundles (cycles)
+    current_bundle = {}  # Current bundle being built
+    bundle_slots = {engine: 0 for engine in SLOT_LIMITS}
+    bundle_writes = set()
+    
+    reg = 0
     r: dict[UOp, int] = {}
     for u in uops:
       assert u.dtype.count in (1,8), "dtype count must be 1 or 8"
@@ -107,37 +217,44 @@ class VLIWRenderer(Renderer):
       # render UOps to instructions
       match u.op:
         case Ops.SINK:
-          inst.append({"flow": [("halt",)]})
+          add_to_bundle("flow", ("halt",))
         case Ops.CONST:
-          inst.append({"load": [("const", r[u], u.arg)]})
+          add_to_bundle("load", ("const", r[u], u.arg))
         case Ops.GEP:
           # a GEP is just an alias to a special register in the vector
           r[u] = r[u.src[0]] + u.arg[0]
         case Ops.VECTORIZE:
           if all(s == u.src[0] for s in u.src):
             # if all sources are the same, we can broadcast
-            inst.append({"valu": [("vbroadcast", r[u], r[u.src[0]])]})
+            add_to_bundle("valu", ("vbroadcast", r[u], r[u.src[0]]))
           else:
             # this is a copy into a contiguous chunk of registers
-            inst.extend({"flow": [("add_imm", r[u]+i, r[s], 0)]} for i,s in enumerate(u.src) if r[s] != r[u]+i)
+            for i, s in enumerate(u.src):
+              if r[s] != r[u] + i:
+                add_to_bundle("flow", ("add_imm", r[u]+i, r[s], 0))
         case Ops.LOAD:
           op = "vload" if u.dtype.count > 1 else "load"
-          inst.append({"load": [(op, r[u], r[u.src[0]])]})
+          add_to_bundle("load", (op, r[u], r[u.src[0]]))
         case Ops.STORE:
           op = "vstore" if u.src[1].dtype.count > 1 else "store"
-          inst.append({"store": [(op, r[u.src[0]], r[u.src[1]])]})
+          add_to_bundle("store", (op, r[u.src[0]], r[u.src[1]]))
         case Ops.MULACC:
           assert u.dtype.count == 8
-          inst.append({"valu": [("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]])]})
+          add_to_bundle("valu", ("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]]))
         case Ops.WHERE:
           assert u.dtype.count == 8
-          inst.append({"flow": [("vselect", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]])]})
+          add_to_bundle("flow", ("vselect", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]]))
         case _ if u.op in self.code_for_op:
           cat = "valu" if u.dtype.count > 1 else "alu"
-          inst.append({cat: [(self.code_for_op[u.op], r[u], r[u.src[0]], r[u.src[1]])]})
+          add_to_bundle(cat, (self.code_for_op[u.op], r[u], r[u.src[0]], r[u.src[1]]))
         case _:
           raise NotImplementedError(f"unhandled op {u.op}")
-    return repr(inst)
+    
+    # Flush final bundle
+    if current_bundle:
+      bundles.append(current_bundle)
+    
+    return repr(bundles)
 
 # ************************* test and render *************************
 
