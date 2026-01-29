@@ -87,14 +87,8 @@ class VLIWRenderer(Renderer):
   pre_matcher = vliw_prepare
 
   def render(self, uops:list[UOp]):
-
-    # TODO: this is a minimal renderer. for low cycle count, make it good
-    # to get speed, you need to add VLIW packing
-    # to get under 1536 regs, you need to add a register allocator
-    # we left the fun parts to you
-
+    # TODO: Register allocator and heuristic ready selection
     print(f"rendering with {len(uops)} uops")
-    
     # Slot limits per engine
     SLOT_LIMITS = {
       "alu": 12,
@@ -105,38 +99,19 @@ class VLIWRenderer(Renderer):
       "debug": 64
     }
     
-    # Phase 1: Generate instructions and build dependency graph in single forward pass
-    instructions: list[tuple[str, tuple]] = []  # (engine, instr_tuple) pairs
-    reads: list[set[int]] = []   # reads[i] = registers read by instruction i
-    writes: list[set[int]] = []  # writes[i] = registers written by instruction i
-    engines: list[str] = []      # engines[i] = engine for instruction i
-
-    # per-instruction memory access metadata (keyed by address register)
-    mem_reads_addr: list[set[int]] = []   # mem_reads_addr[i] = address regs read (LOAD)
-    mem_writes_addr: list[set[int]] = []  # mem_writes_addr[i] = address regs written (STORE)
-    
-    # register dependency tracking
+    instructions: list[tuple[str, tuple]] = []  # (engine, instr_tuple) 
     last_write: dict[int, int] = {}  # last_write[reg] = instruction index that last wrote reg
-    users: list[list[int]] = []      # users[i] = instructions that depend on i
-    deps_left: list[int] = []        # deps_left[i] = remaining dependencies
-
-    # memory dependency tracking (by address register)
-    last_mem_write: dict[int, int] = {}  # last_mem_write[addr_reg] = last store to that address
-    last_mem_read: dict[int, int] = {}   # last_mem_read[addr_reg] = last load from that address
+    users: list[list[int]] = []  # users[i] = instructions that depend on i
+    deps_left: list[int] = []  # deps_left[i] = remaining dependencies
     
     def build_deps(engine: str, instr_tuple: tuple, r_set: set[int], w_set: set[int]):
-      """Add instruction and build register + memory dependencies."""
+      """Add instruction and build dependencies."""
       i = len(instructions)
       instructions.append((engine, instr_tuple))
-      reads.append(r_set)
-      writes.append(w_set)
-      engines.append(engine)
       users.append([])
       deps_left.append(0)
-      mem_reads_addr.append(set())
-      mem_writes_addr.append(set())
       
-      # Build register dependencies: RAW and WAW
+      # Build dependencies: RAW and WAW
       for reg in r_set:
         if reg in last_write:
           users[last_write[reg]].append(i)
@@ -146,28 +121,6 @@ class VLIWRenderer(Renderer):
           users[last_write[reg]].append(i)
           deps_left[i] += 1
         last_write[reg] = i
-
-      # Build memory dependencies keyed by address register for LOAD/STORE
-      if engine in ("load", "store"):
-        # Convention: LOAD: (op, dest, addr_reg), STORE: (op, addr_reg, src)
-        addr_reg = instr_tuple[2] if engine == "load" else instr_tuple[1]
-        if engine == "load":
-          # LOAD depends on last STORE to the same address (memory RAW)
-          if addr_reg in last_mem_write:
-            users[last_mem_write[addr_reg]].append(i)
-            deps_left[i] += 1
-          last_mem_read[addr_reg] = i
-          mem_reads_addr[i].add(addr_reg)
-        else:
-          # STORE after last STORE (WAW) and after last LOAD (WAR) to the same address
-          if addr_reg in last_mem_write:
-            users[last_mem_write[addr_reg]].append(i)
-            deps_left[i] += 1
-          if addr_reg in last_mem_read:
-            users[last_mem_read[addr_reg]].append(i)
-            deps_left[i] += 1
-          last_mem_write[addr_reg] = i
-          mem_writes_addr[i].add(addr_reg)
     
     reg = 0
     r: dict[UOp, int] = {}
@@ -182,7 +135,8 @@ class VLIWRenderer(Renderer):
       # Generate instruction and build read/writes 
       match u.op:
         case Ops.SINK:
-          build_deps("flow", ("halt",), set(), set())
+          # build_deps("flow", ("halt",), set(), set())
+          pass
         case Ops.CONST:
           build_deps("load", ("const", r[u], u.arg), set(), {r[u]})
         case Ops.GEP:
@@ -202,8 +156,7 @@ class VLIWRenderer(Renderer):
         case Ops.STORE:
           op = "vstore" if u.src[1].dtype.count > 1 else "store"
           count = 8 if op == "vstore" else 1
-          build_deps("store", (op, r[u.src[0]], r[u.src[1]]),
-                     {r[u.src[0]]} | set(range(r[u.src[1]], r[u.src[1]] + count)), set())
+          build_deps("store", (op, r[u.src[0]], r[u.src[1]]), {r[u.src[0]]} | set(range(r[u.src[1]], r[u.src[1]] + count)), set())
         case Ops.MULACC:
           assert u.dtype.count == 8
           build_deps("valu", ("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]]),
@@ -223,94 +176,25 @@ class VLIWRenderer(Renderer):
         case _:
           raise NotImplementedError(f"unhandled op {u.op}")
     
-    # Scheduler
     ready = [i for i in range(len(instructions)) if deps_left[i] == 0]
-    scheduled = [False] * len(instructions)
     bundles = []
-    
-    while ready or any(not s for s in scheduled):
-      # Start new bundle
-      current_bundle = {}
-      bundle_slots = {e: 0 for e in SLOT_LIMITS}
-      bundle_writes = set()
-      bundle_mem_reads = set()   # address registers read in this bundle
-      bundle_mem_writes = set()  # address registers written in this bundle
-      bundle_added = False
-      
-      # Try to fill bundle from ready list
-      remaining_ready = []
+
+    while ready:
+      current, slots, next = {}, {e: 0 for e in SLOT_LIMITS}, []
+
       for i in ready:
-        if scheduled[i]:
-          continue
-        
-        engine = engines[i]
-        
-        # Check if instruction fits in current bundle
-        mem_conflict = (
-          (mem_reads_addr[i] & bundle_mem_writes) or
-          (mem_writes_addr[i] & (bundle_mem_reads | bundle_mem_writes))
-        )
-        fits = (
-          bundle_slots[engine] < SLOT_LIMITS[engine] and
-          not (reads[i] & bundle_writes) and  # No RAW hazard
-          not (writes[i] & bundle_writes) and # No WAW hazard
-          not mem_conflict                    # No memory hazards on same addr_reg
-        )
-        
-        if fits:
-          # Add to bundle
-          current_bundle.setdefault(engine, []).append(instructions[i][1])
-          bundle_slots[engine] += 1
-          bundle_writes.update(writes[i])
-          bundle_mem_reads.update(mem_reads_addr[i])
-          bundle_mem_writes.update(mem_writes_addr[i])
-          scheduled[i] = True
-          bundle_added = True
-          
-          # Update dependencies: mark dependent instructions as potentially ready
-          for u in users[i]:
-            deps_left[u] -= 1
-            if deps_left[u] == 0:
-              remaining_ready.append(u)
-        else:
-          remaining_ready.append(i)
-      
-      # Forward progress guarantee: if bundle empty and ready list non-empty,
-      # schedule at least one instruction (relax slot/register hazards if needed,
-      # but still respect memory hazards to the same addr_reg)
-      if not bundle_added and remaining_ready:
-        # Pick first ready instruction that satisfies at least slot limit
-        for i in remaining_ready:
-          if scheduled[i]:
-            continue
-          engine = engines[i]
-          mem_conflict = (
-            (mem_reads_addr[i] & bundle_mem_writes) or
-            (mem_writes_addr[i] & (bundle_mem_reads | bundle_mem_writes))
-          )
-          if bundle_slots[engine] < SLOT_LIMITS[engine] and not mem_conflict:
-            current_bundle.setdefault(engine, []).append(instructions[i][1])
-            bundle_slots[engine] += 1
-            bundle_writes.update(writes[i])
-            bundle_mem_reads.update(mem_reads_addr[i])
-            bundle_mem_writes.update(mem_writes_addr[i])
-            scheduled[i] = True
-            bundle_added = True
-            
-            for u in users[i]:
-              deps_left[u] -= 1
-              if deps_left[u] == 0:
-                remaining_ready.append(u)
-            break
-      
-      # Emit bundle if non-empty
-      if current_bundle:
-        bundles.append(current_bundle)
-      
-      # Update ready list for next cycle
-      ready = remaining_ready
-    
+        eng = instructions[i][0]
+        if slots[eng] >= SLOT_LIMITS[eng]: next.append(i); continue
+        current.setdefault(eng, []).append(instructions[i][1])
+        slots[eng] += 1
+        for u in users[i]:
+          deps_left[u] -= 1
+          if deps_left[u] == 0: next.append(u)
+      bundles.append(current)
+      ready = next
+    bundles.append({"flow": [("halt",)]})
     return repr(bundles)
+
 
 # ************************* test and render *************************
 
