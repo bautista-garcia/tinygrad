@@ -77,6 +77,122 @@ vliw_prepare = PatternMatcher([
   (UPat(Ops.INDEX, name="i"), lambda i: i.src[0]+i.src[1]),
 ])+symbolic
 
+class VLIWPacker:
+  def __init__(self, uops: list[UOp], code_for_op, SLOT_LIMITS):
+    self.uops = uops
+    self.code_for_op = code_for_op
+    self.SLOT_LIMITS = SLOT_LIMITS
+    self.instructions: list[tuple] = []  # (engine, uop, variant)
+    self.users: list[list[int]] = []
+    self.deps_left: list[int] = []
+    self.build_deps()
+
+  def build_deps(self):
+    def_instr: dict[UOp, list[int]] = {}  # maps uop -> list of instruction indices it produces
+
+    def add(engine: str, uop: UOp, variant, src_uops: list[UOp]):
+      i = len(self.instructions)
+      self.instructions.append((engine, uop, variant))
+      self.users.append([])
+      self.deps_left.append(0)
+      for s in src_uops:
+        for pred in def_instr.get(s, []):
+          self.users[pred].append(i)
+          self.deps_left[i] += 1
+      return i
+
+    for u in self.uops:
+      if u.op is Ops.SINK: continue
+      if u.op is Ops.GEP:
+        def_instr[u] = def_instr.get(u.src[0], [])
+        continue
+
+      match u.op:
+        case Ops.CONST:
+          def_instr[u] = [add("load", u, None, [])]
+        case Ops.VECTORIZE:
+          if all(s == u.src[0] for s in u.src):
+            def_instr[u] = [add("valu", u, "broadcast", [u.src[0]])]
+          else:
+            def_instr[u] = [add("flow", u, lane, [s]) for lane, s in enumerate(u.src)]
+        case Ops.LOAD:
+          def_instr[u] = [add("load", u, None, [u.src[0]])]
+        case Ops.STORE:
+          add("store", u, None, list(u.src[:2]))
+        case Ops.MULACC:
+          def_instr[u] = [add("valu", u, None, list(u.src))]
+        case Ops.WHERE:
+          def_instr[u] = [add("flow", u, None, list(u.src))]
+        case _ if u.op in self.code_for_op:
+          engine = "valu" if u.dtype.count > 1 else "alu"
+          def_instr[u] = [add(engine, u, None, list(u.src))]
+        case _:
+          raise NotImplementedError(f"unhandled op {u.op}")
+
+  def pack(self):
+    is_load = [self.instructions[i][0] == "load" for i in range(len(self.instructions))]
+    unlocks_load = [any(is_load[u] for u in self.users[i]) for i in range(len(self.instructions))]
+    outdeg = [len(self.users[i]) for i in range(len(self.instructions))]
+
+    ready = [i for i in range(len(self.instructions)) if self.deps_left[i] == 0]
+    bundles = []
+    while ready:
+      current, slots, next_ready = {}, {e: 0 for e in self.SLOT_LIMITS}, []
+      ready.sort(key=lambda i: (unlocks_load[i], -outdeg[i], i))
+      for i in ready:
+        eng = self.instructions[i][0]
+        if slots[eng] >= self.SLOT_LIMITS[eng]:
+          next_ready.append(i)
+          continue
+        current.setdefault(eng, []).append(i)
+        slots[eng] += 1
+        for u in self.users[i]:
+          self.deps_left[u] -= 1
+          if self.deps_left[u] == 0: next_ready.append(u)
+      bundles.append(current)
+      ready = next_ready
+    return bundles
+
+  def emit(self, bundles):
+    # Register allocation
+    reg = 0
+    r: dict[UOp, int] = {}
+    for u in self.uops:
+      if u.op not in {Ops.STORE, Ops.SINK, Ops.GEP}:
+        r[u] = reg
+        reg += u.dtype.count
+      elif u.op is Ops.GEP:
+        r[u] = r[u.src[0]] + u.arg[0]
+
+    def to_tuple(instr_idx):
+      _, uop, variant = self.instructions[instr_idx]
+      match uop.op:
+        case Ops.CONST: return ("const", r[uop], uop.arg)
+        case Ops.VECTORIZE:
+          if variant == "broadcast": return ("vbroadcast", r[uop], r[uop.src[0]])
+          src = uop.src[variant]
+          return ("add_imm", r[uop] + variant, r[src], 0) if r[src] != r[uop] + variant else None
+        case Ops.LOAD:
+          return ("vload" if uop.dtype.count > 1 else "load", r[uop], r[uop.src[0]])
+        case Ops.STORE:
+          return ("vstore" if uop.src[1].dtype.count > 1 else "store", r[uop.src[0]], r[uop.src[1]])
+        case Ops.MULACC:
+          return ("multiply_add", r[uop], r[uop.src[0]], r[uop.src[1]], r[uop.src[2]])
+        case Ops.WHERE:
+          return ("vselect", r[uop], r[uop.src[0]], r[uop.src[1]], r[uop.src[2]])
+        case _:
+          return (self.code_for_op[uop.op], r[uop], r[uop.src[0]], r[uop.src[1]])
+
+    result = []
+    for bundle in bundles:
+      out = {}
+      for engine, indices in bundle.items():
+        tuples = [t for i in indices if (t := to_tuple(i)) is not None]
+        if tuples: out[engine] = tuples
+      if out: result.append(out)
+    result.append({"flow": [("halt",)]})
+    return repr(result)
+
 class VLIWRenderer(Renderer):
   has_local = False  # TODO: this should be the default / cleaned up
   # this says this backend supports MULACC + more. decompositions uses this
@@ -87,113 +203,11 @@ class VLIWRenderer(Renderer):
   pre_matcher = vliw_prepare
 
   def render(self, uops:list[UOp]):
-    # TODO: Register allocator and heuristic ready selection
     print(f"rendering with {len(uops)} uops")
-    # Slot limits per engine
-    SLOT_LIMITS = {
-      "alu": 12,
-      "valu": 6,
-      "load": 2,
-      "store": 2,
-      "flow": 1,
-      "debug": 64
-    }
-    
-    instructions: list[tuple[str, tuple]] = []  # (engine, instr_tuple) 
-    last_write: dict[int, int] = {}  # last_write[reg] = instruction index that last wrote reg
-    users: list[list[int]] = []  # users[i] = instructions that depend on i
-    deps_left: list[int] = []  # deps_left[i] = remaining dependencies
-    
-    def build_deps(engine: str, instr_tuple: tuple, r_set: set[int], w_set: set[int]):
-      """Add instruction and build dependencies."""
-      i = len(instructions)
-      instructions.append((engine, instr_tuple))
-      users.append([])
-      deps_left.append(0)
-      
-      # Build dependencies: RAW and WAW
-      for reg in r_set:
-        if reg in last_write:
-          users[last_write[reg]].append(i)
-          deps_left[i] += 1
-      for reg in w_set:
-        if reg in last_write:
-          users[last_write[reg]].append(i)
-          deps_left[i] += 1
-        last_write[reg] = i
-    
-    reg = 0
-    r: dict[UOp, int] = {}
-    for u in uops:
-      assert u.dtype.count in (1,8), "dtype count must be 1 or 8"
-
-      # dumb register allocator
-      if u.op not in {Ops.STORE, Ops.SINK, Ops.GEP}:
-        r[u] = reg
-        reg += u.dtype.count
-
-      # Generate instruction and build read/writes 
-      match u.op:
-        case Ops.SINK:
-          # build_deps("flow", ("halt",), set(), set())
-          pass
-        case Ops.CONST:
-          build_deps("load", ("const", r[u], u.arg), set(), {r[u]})
-        case Ops.GEP:
-          # a GEP is just an alias to a special register in the vector
-          r[u] = r[u.src[0]] + u.arg[0]
-        case Ops.VECTORIZE:
-          if all(s == u.src[0] for s in u.src):
-            build_deps("valu", ("vbroadcast", r[u], r[u.src[0]]), {r[u.src[0]]}, set(range(r[u], r[u] + 8)))
-          else:
-            for i, s in enumerate(u.src):
-              if r[s] != r[u] + i:
-                build_deps("flow", ("add_imm", r[u]+i, r[s], 0), {r[s]}, {r[u]+i})
-        case Ops.LOAD:
-          op = "vload" if u.dtype.count > 1 else "load"
-          count = 8 if op == "vload" else 1
-          build_deps("load", (op, r[u], r[u.src[0]]), {r[u.src[0]]}, set(range(r[u], r[u] + count)))
-        case Ops.STORE:
-          op = "vstore" if u.src[1].dtype.count > 1 else "store"
-          count = 8 if op == "vstore" else 1
-          build_deps("store", (op, r[u.src[0]], r[u.src[1]]), {r[u.src[0]]} | set(range(r[u.src[1]], r[u.src[1]] + count)), set())
-        case Ops.MULACC:
-          assert u.dtype.count == 8
-          build_deps("valu", ("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]]),
-                    set(range(r[u.src[0]], r[u.src[0]] + 8)) | set(range(r[u.src[1]], r[u.src[1]] + 8)) | set(range(r[u.src[2]], r[u.src[2]] + 8)),
-                    set(range(r[u], r[u] + 8)))
-        case Ops.WHERE:
-          assert u.dtype.count == 8
-          build_deps("flow", ("vselect", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]]),
-                    set(range(r[u.src[0]], r[u.src[0]] + 8)) | set(range(r[u.src[1]], r[u.src[1]] + 8)) | set(range(r[u.src[2]], r[u.src[2]] + 8)),
-                    set(range(r[u], r[u] + 8)))
-        case _ if u.op in self.code_for_op:
-          cat = "valu" if u.dtype.count > 1 else "alu"
-          count = 8 if cat == "valu" else 1
-          build_deps(cat, (self.code_for_op[u.op], r[u], r[u.src[0]], r[u.src[1]]),
-                    set(range(r[u.src[0]], r[u.src[0]] + count)) | set(range(r[u.src[1]], r[u.src[1]] + count)),
-                    set(range(r[u], r[u] + count)))
-        case _:
-          raise NotImplementedError(f"unhandled op {u.op}")
-    
-    ready = [i for i in range(len(instructions)) if deps_left[i] == 0]
-    bundles = []
-
-    while ready:
-      current, slots, next = {}, {e: 0 for e in SLOT_LIMITS}, []
-
-      for i in ready:
-        eng = instructions[i][0]
-        if slots[eng] >= SLOT_LIMITS[eng]: next.append(i); continue
-        current.setdefault(eng, []).append(instructions[i][1])
-        slots[eng] += 1
-        for u in users[i]:
-          deps_left[u] -= 1
-          if deps_left[u] == 0: next.append(u)
-      bundles.append(current)
-      ready = next
-    bundles.append({"flow": [("halt",)]})
-    return repr(bundles)
+    SLOT_LIMITS = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1, "debug": 64}
+    packer = VLIWPacker(uops, self.code_for_op, SLOT_LIMITS)
+    bundles = packer.pack()
+    return packer.emit(bundles)
 
 
 # ************************* test and render *************************
