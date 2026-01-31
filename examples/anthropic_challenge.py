@@ -3,6 +3,7 @@ from tinygrad.uop.ops import Ops, PatternMatcher, UPat
 from tinygrad.uop.symbolic import symbolic
 from tinygrad.codegen import Renderer
 from tinygrad.codegen.opt import Opt, OptOps
+from dataclasses import dataclass
 
 # ************************* implementation of the problem ************************
 
@@ -66,6 +67,9 @@ def loop_unrolling(sink:UOp):
   return UOp.sink(*unrolled_sinks, arg=sink.arg)
 
 global_addrs = []
+
+
+
 vliw_prepare = PatternMatcher([
   # loop unrolling (should be a part of tinygrad)
   (UPat(Ops.SINK, name="sink"), loop_unrolling),
@@ -77,7 +81,17 @@ vliw_prepare = PatternMatcher([
   (UPat(Ops.INDEX, name="i"), lambda i: i.src[0]+i.src[1]),
 ])+symbolic
 
+
+
+@dataclass(frozen=True)
+class ScheduledOp:
+  idx: int
+  engine: str
+  elements: tuple[int,int] | None = None
+
+
 class VLIWPacker:
+  DEMOTABLE = {Ops.ADD, Ops.MUL, Ops.XOR, Ops.AND, Ops.OR, Ops.SHL, Ops.SHR, Ops.CMPLT}
   def __init__(self, uops: list[UOp], code_for_op, SLOT_LIMITS):
     self.uops = uops
     self.code_for_op = code_for_op
@@ -86,6 +100,14 @@ class VLIWPacker:
     self.users: list[list[int]] = []
     self.deps_left: list[int] = []
     self.build_deps()
+    # self.batch_id = self.assign_batch_ids()
+    # self.depth = self.compute_depth()
+    # self.offsets = self.compute_offsets()
+
+
+  def demotable(self, i: int) -> bool:
+    eng, uop, variant = self.instructions[i]
+    return eng == "valu" and variant is None and uop.op in self.DEMOTABLE and uop.dtype.count == 8
 
   def build_deps(self):
     def_instr: dict[UOp, list[int]] = {}  # maps uop -> list of instruction indices it produces
@@ -128,70 +150,163 @@ class VLIWPacker:
           def_instr[u] = [add(engine, u, None, list(u.src))]
         case _:
           raise NotImplementedError(f"unhandled op {u.op}")
+        
+  # def assign_batch_ids(self) -> list[int|None]:
+  #   sink = self.uops[-1]
+  #   assert sink.op is Ops.SINK and len(sink.src) == 32
+
+  #   uop_batch: dict[UOp, int|None] = {}
+  #   seen: set[tuple[UOp,int]] = set()
+
+  #   def walk(u: UOp, bi: int):
+  #     k = (u, bi)
+  #     if k in seen: return
+  #     seen.add(k)
+
+  #     if u not in uop_batch: uop_batch[u] = bi
+  #     elif uop_batch[u] != bi: uop_batch[u] = None  # shared across batches
+
+  #     for s in u.src: walk(s, bi)
+
+  #   for bi, root in enumerate(sink.src):
+  #     walk(root, bi)
+
+  #   return [uop_batch.get(uop, None) for _, uop, _ in self.instructions]
+  
+  # def compute_depth(self) -> list[int]:
+  #   n = len(self.instructions)
+  #   depth = [0]*n
+  #   for i in range(n-1, -1, -1):
+  #     if self.users[i]:
+  #       depth[i] = 1 + max(depth[u] for u in self.users[i])
+  #   return depth
+  
+  # def compute_offsets(self) -> list[int]:
+  #   sink = self.uops[-1]
+  #   B = len(sink.src)   # 32
+  #   sched_len = max(self.depth) + 1 if self.depth else 1
+  #   spacing = max(1, sched_len // B)
+  #   return [(bi * spacing) % sched_len for bi in range(B)]
+
+  # def prio(self, i):
+  #   bid = self.batch_id[i]
+  #   off = self.offsets[bid] if bid is not None else 0
+  #   return -(self.depth[i] + off)   # more depth => smaller key => earlier
+
 
   def pack(self):
-    is_load = [self.instructions[i][0] == "load" for i in range(len(self.instructions))]
-    unlocks_load = [any(is_load[u] for u in self.users[i]) for i in range(len(self.instructions))]
-    outdeg = [len(self.users[i]) for i in range(len(self.instructions))]
+    # heuristics for scheduling
+    n = len(self.instructions)
+    is_load = [self.instructions[i][0] == "load" for i in range(n)]
+    unlocks_load = [any(is_load[u] for u in self.users[i]) for i in range(n)]
+    outdeg = [len(self.users[i]) for i in range(n)]
 
-    ready = [i for i in range(len(self.instructions)) if self.deps_left[i] == 0]
-    bundles = []
-    while ready:
+    ready = [i for i in range(n) if self.deps_left[i] == 0]
+    bundles: list[dict[str, list[ScheduledOp]]] = []
+    pending_split: int | None = None
+
+    while ready or pending_split is not None:
       current, slots, next_ready = {}, {e: 0 for e in self.SLOT_LIMITS}, []
-      ready.sort(key=lambda i: (unlocks_load[i], -outdeg[i], i))
-      for i in ready:
-        eng = self.instructions[i][0]
-        if slots[eng] >= self.SLOT_LIMITS[eng]:
-          next_ready.append(i)
-          continue
-        current.setdefault(eng, []).append(i)
-        slots[eng] += 1
-        for u in self.users[i]:
+      # finish pending split first (hi half)
+      if pending_split is not None:
+        current.setdefault("alu", []).append(ScheduledOp(pending_split, "alu", (4, 8)))
+        slots["alu"] += 4
+        for u in self.users[pending_split]:
           self.deps_left[u] -= 1
           if self.deps_left[u] == 0: next_ready.append(u)
-      bundles.append(current)
+        pending_split = None  # reset
+
+      if not ready:
+        if current: bundles.append(current)
+        break
+
+      ready.sort(key=lambda i: (-outdeg[i], -unlocks_load[i]))
+
+      for i in ready:
+        eng = self.instructions[i][0]
+
+        # base scheduling
+        if slots[eng] < self.SLOT_LIMITS[eng]:
+          current.setdefault(eng, []).append(ScheduledOp(i, eng, None))
+          slots[eng] += 1
+          for u in self.users[i]:
+            self.deps_left[u] -= 1
+            if self.deps_left[u] == 0: next_ready.append(u)
+          continue
+
+        # valu -> alu demotion
+        if eng == "valu" and self.demotable(i):
+          alu_spare = self.SLOT_LIMITS["alu"] - slots["alu"]
+          if alu_spare >= 8: # 8 wide demotion
+            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 8)))
+            slots["alu"] += 8
+            for u in self.users[i]:
+              self.deps_left[u] -= 1
+              if self.deps_left[u] == 0: next_ready.append(u)
+            continue
+          if alu_spare >= 4 and pending_split is None: # 4+4 split demotion
+            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 4)))
+            slots["alu"] += 4
+            pending_split = i
+            continue  
+
+        next_ready.append(i)
+
+      if current: bundles.append(current)
       ready = next_ready
+
     return bundles
 
   def emit(self, bundles):
-    # Register allocation
-    reg = 0
-    r: dict[UOp, int] = {}
+    # reg alloc
+    reg, r = 0, {}
     for u in self.uops:
       if u.op not in {Ops.STORE, Ops.SINK, Ops.GEP}:
-        r[u] = reg
-        reg += u.dtype.count
+        r[u] = reg; reg += u.dtype.count
       elif u.op is Ops.GEP:
         r[u] = r[u.src[0]] + u.arg[0]
 
-    def to_tuple(instr_idx):
-      _, uop, variant = self.instructions[instr_idx]
-      match uop.op:
-        case Ops.CONST: return ("const", r[uop], uop.arg)
-        case Ops.VECTORIZE:
-          if variant == "broadcast": return ("vbroadcast", r[uop], r[uop.src[0]])
-          src = uop.src[variant]
-          return ("add_imm", r[uop] + variant, r[src], 0) if r[src] != r[uop] + variant else None
-        case Ops.LOAD:
-          return ("vload" if uop.dtype.count > 1 else "load", r[uop], r[uop.src[0]])
-        case Ops.STORE:
-          return ("vstore" if uop.src[1].dtype.count > 1 else "store", r[uop.src[0]], r[uop.src[1]])
-        case Ops.MULACC:
-          return ("multiply_add", r[uop], r[uop.src[0]], r[uop.src[1]], r[uop.src[2]])
-        case Ops.WHERE:
-          return ("vselect", r[uop], r[uop.src[0]], r[uop.src[1]], r[uop.src[2]])
-        case _:
-          return (self.code_for_op[uop.op], r[uop], r[uop.src[0]], r[uop.src[1]])
+    def lane_reg(u: UOp, lane: int):
+      return r[u] + lane if u.dtype.count > 1 else r[u]
+
+    def emit_base(i: int):
+      _, u, v = self.instructions[i]
+      op = u.op
+      if op is Ops.CONST: return ("const", r[u], u.arg)
+      if op is Ops.VECTORIZE:
+        if v == "broadcast": return ("vbroadcast", r[u], r[u.src[0]])
+        s = u.src[v]
+        return None if r[s] == r[u] + v else ("add_imm", r[u] + v, r[s], 0)
+      if op is Ops.LOAD:  return (("vload" if u.dtype.count > 1 else "load"),  r[u], r[u.src[0]])
+      if op is Ops.STORE: return (("vstore" if u.src[1].dtype.count > 1 else "store"), r[u.src[0]], r[u.src[1]])
+      if op is Ops.MULACC: return ("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]])
+      if op is Ops.WHERE:  return ("vselect", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]])
+      return (self.code_for_op[op], r[u], r[u.src[0]], r[u.src[1]])
 
     result = []
     for bundle in bundles:
       out = {}
-      for engine, indices in bundle.items():
-        tuples = [t for i in indices if (t := to_tuple(i)) is not None]
-        if tuples: out[engine] = tuples
+      for eng, items in bundle.items():
+        tup = []
+        for it in items:
+          it = it if isinstance(it, ScheduledOp) else ScheduledOp(it, eng, None)
+
+          if it.elements is None:
+            t = emit_base(it.idx)
+            if t is not None: tup.append(t)
+          else:
+            _, u, _ = self.instructions[it.idx]
+            op = self.code_for_op[u.op]  
+            lo, hi = it.elements
+            tup += [(op, lane_reg(u, k), lane_reg(u.src[0], k), lane_reg(u.src[1], k)) for k in range(lo, hi)]
+
+        if tup: out[eng] = tup
       if out: result.append(out)
+
     result.append({"flow": [("halt",)]})
     return repr(result)
+
+
 
 class VLIWRenderer(Renderer):
   has_local = False  # TODO: this should be the default / cleaned up
@@ -204,6 +319,7 @@ class VLIWRenderer(Renderer):
 
   def render(self, uops:list[UOp]):
     print(f"rendering with {len(uops)} uops")
+    print(f"len(uops[-1].src): {len(uops[-1].src)}")
     SLOT_LIMITS = {"alu": 12, "valu": 6, "load": 2, "store": 2, "flow": 1, "debug": 64}
     packer = VLIWPacker(uops, self.code_for_op, SLOT_LIMITS)
     bundles = packer.pack()
@@ -256,9 +372,14 @@ if __name__ == "__main__":
   src = eval(prg.src)
   max_regs = max(t[1] for instr in src for v in instr.values() for t in v if len(t) > 1) + 8
   print(f"{max_regs:5d} regs used" + ("" if max_regs <= 1536 else "       <-- WARNING: TOO MANY REGISTERS, MUST BE <= 1536"))
-  machine = problem.Machine(mem, src, problem.DebugInfo(scratch_map={}), n_cores=1, trace=False, scratch_size=max_regs)
+  enable_trace = getenv("TRACE", 0)
+  machine = problem.Machine(mem, src, problem.DebugInfo(scratch_map={}), n_cores=1, trace=bool(enable_trace), scratch_size=max_regs)
   machine.run()
   print(f"ran for {machine.cycle:5d} cycles" + ("" if machine.cycle <= 1363 else "  <-- EVEN CLAUDE GOT 1363"))
+  if enable_trace:
+    print(f"Trace saved to trace.json")
+    print(f"  View in Chrome: chrome://tracing (load trace.json)")
+    print(f"  View online: https://ui.perfetto.dev (drag trace.json)")
 
   # compare to reference
   ref_mem = mem.copy()
