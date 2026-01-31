@@ -136,7 +136,8 @@ class VLIWPacker:
           if all(s == u.src[0] for s in u.src):
             def_instr[u] = [add("valu", u, "broadcast", [u.src[0]])]
           else:
-            def_instr[u] = [add("flow", u, lane, [s]) for lane, s in enumerate(u.src)]
+            # Non-broadcast VECTORIZE: ALU moves (not flow)
+            def_instr[u] = [add("alu", u, "moves", list(u.src))]
         case Ops.LOAD:
           def_instr[u] = [add("load", u, None, [u.src[0]])]
         case Ops.STORE:
@@ -150,49 +151,85 @@ class VLIWPacker:
           def_instr[u] = [add(engine, u, None, list(u.src))]
         case _:
           raise NotImplementedError(f"unhandled op {u.op}")
-        
-  # def assign_batch_ids(self) -> list[int|None]:
-  #   sink = self.uops[-1]
-  #   assert sink.op is Ops.SINK and len(sink.src) == 32
 
-  #   uop_batch: dict[UOp, int|None] = {}
-  #   seen: set[tuple[UOp,int]] = set()
+    # Build reverse mapping: deps[i] = list of instruction indices that i depends on
+    n = len(self.instructions)
+    self.deps: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+      for user_idx in self.users[i]:
+        self.deps[user_idx].append(i)
 
-  #   def walk(u: UOp, bi: int):
-  #     k = (u, bi)
-  #     if k in seen: return
-  #     seen.add(k)
+    # Build uop_to_idx mapping for batch assignment
+    self.uop_to_idx: dict[UOp, int] = {}
+    for idx, (_, uop, _) in enumerate(self.instructions):
+      if uop not in self.uop_to_idx:
+        self.uop_to_idx[uop] = idx
 
-  #     if u not in uop_batch: uop_batch[u] = bi
-  #     elif uop_batch[u] != bi: uop_batch[u] = None  # shared across batches
+    # Compute depth, batch_ids, and offsets
+    self.depth = self._compute_depth()
+    self.batch_ids, self.offsets = self._assign_batches()
 
-  #     for s in u.src: walk(s, bi)
+  def _compute_depth(self) -> list[int]:
+    """Compute critical path depth for each instruction (used for scheduling priority)."""
+    n = len(self.instructions)
+    depth = [0] * n
+    for i in range(n):
+      if self.deps[i]:
+        depth[i] = 1 + max(depth[d] for d in self.deps[i])
+    return depth
 
-  #   for bi, root in enumerate(sink.src):
-  #     walk(root, bi)
+  def _assign_batches(self) -> tuple[list[int | None], list[int]]:
+    """Assign batch IDs and compute stagger offsets."""
+    n = len(self.instructions)
+    batch_ids: list[int | None] = [None] * n
+    sink = self.uops[-1]
+    assert sink.op is Ops.SINK
+    batch_count = len(sink.src)
 
-  #   return [uop_batch.get(uop, None) for _, uop, _ in self.instructions]
-  
-  # def compute_depth(self) -> list[int]:
-  #   n = len(self.instructions)
-  #   depth = [0]*n
-  #   for i in range(n-1, -1, -1):
-  #     if self.users[i]:
-  #       depth[i] = 1 + max(depth[u] for u in self.users[i])
-  #   return depth
-  
-  # def compute_offsets(self) -> list[int]:
-  #   sink = self.uops[-1]
-  #   B = len(sink.src)   # 32
-  #   sched_len = max(self.depth) + 1 if self.depth else 1
-  #   spacing = max(1, sched_len // B)
-  #   return [(bi * spacing) % sched_len for bi in range(B)]
+    if batch_count > 1:
+      # visited_by[i] = which batch last visited instruction i
+      visited_by: list[int | None] = [None] * n
+      def walk(u: UOp, bi: int):
+        idx = self.uop_to_idx.get(u)
+        if idx is None: return
+        if visited_by[idx] == bi: return  # already visited by this batch
+        visited_by[idx] = bi
+        if batch_ids[idx] is None: batch_ids[idx] = bi
+        elif batch_ids[idx] != bi: batch_ids[idx] = None  # shared across batches
+        for s in u.src: walk(s, bi)
+      for bi, root in enumerate(sink.src): walk(root, bi)
 
-  # def prio(self, i):
-  #   bid = self.batch_id[i]
-  #   off = self.offsets[bid] if bid is not None else 0
-  #   return -(self.depth[i] + off)   # more depth => smaller key => earlier
+    # stagger batches evenly across the schedule
+    schedule_length = max(self.depth) + 1 if self.depth else 1
+    spacing = schedule_length // batch_count if batch_count > 0 else 1
+    offsets = [(bi * spacing) % schedule_length for bi in range(batch_count)]
+    return batch_ids, offsets
 
+  def _priority(self, i: int) -> int:
+    """Scheduling priority: lower = scheduled earlier."""
+    bid = self.batch_ids[i]
+    # shared instructions (bid=None) get offset 0, so they're scheduled first
+    return self.depth[i] + (self.offsets[bid] if bid is not None else 0)
+
+  def _engine(self, uop: UOp) -> str:
+    """Get the engine for a UOp."""
+    # Find the instruction index for this UOp
+    idx = self.uop_to_idx.get(uop)
+    if idx is not None:
+      eng, _, variant = self.instructions[idx]
+      # Non-broadcast VECTORIZE is ALU (not flow)
+      if eng == "alu" and variant == "moves":
+        return "alu"
+      return eng
+    return "none"
+
+  def _slot_count(self, i: int) -> int:
+    """Return slot cost for instruction i."""
+    _, uop, variant = self.instructions[i]
+    # Non-broadcast VECTORIZE costs = number of unique scalar sources (ALU moves)
+    if uop.op is Ops.VECTORIZE and variant == "moves":
+      return len(set(uop.src))
+    return 1
 
   def pack(self):
     # heuristics for scheduling
@@ -220,37 +257,43 @@ class VLIWPacker:
         if current: bundles.append(current)
         break
 
-      ready.sort(key=lambda i: (-outdeg[i], -unlocks_load[i]))
-
+      # group ready ops by engine and sort by priority
+      ready_by_engine: dict[str, list[int]] = {k: [] for k in [*self.SLOT_LIMITS.keys(), "none"]}
       for i in ready:
-        eng = self.instructions[i][0]
+        engine, _, _ = self.instructions[i]
+        ready_by_engine[engine].append(i)
+      for eng in ready_by_engine:
+        ready_by_engine[eng].sort(key=self._priority)
 
-        # base scheduling
-        if slots[eng] < self.SLOT_LIMITS[eng]:
-          current.setdefault(eng, []).append(ScheduledOp(i, eng, None))
-          slots[eng] += 1
-          for u in self.users[i]:
-            self.deps_left[u] -= 1
-            if self.deps_left[u] == 0: next_ready.append(u)
-          continue
-
-        # valu -> alu demotion
-        if eng == "valu" and self.demotable(i):
-          alu_spare = self.SLOT_LIMITS["alu"] - slots["alu"]
-          if alu_spare >= 8: # 8 wide demotion
-            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 8)))
-            slots["alu"] += 8
+      for eng in ready_by_engine:
+        for i in ready_by_engine[eng]:
+          # base scheduling
+          cost = self._slot_count(i)
+          if slots[eng] + cost <= self.SLOT_LIMITS[eng]:
+            current.setdefault(eng, []).append(ScheduledOp(i, eng, None))
+            slots[eng] += cost
             for u in self.users[i]:
               self.deps_left[u] -= 1
               if self.deps_left[u] == 0: next_ready.append(u)
             continue
-          if alu_spare >= 4 and pending_split is None: # 4+4 split demotion
-            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 4)))
-            slots["alu"] += 4
-            pending_split = i
-            continue  
 
-        next_ready.append(i)
+          # valu -> alu demotion
+          if eng == "valu" and self.demotable(i):
+            alu_spare = self.SLOT_LIMITS["alu"] - slots["alu"]
+            if alu_spare >= 8: # 8 wide demotion
+              current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 8)))
+              slots["alu"] += 8
+              for u in self.users[i]:
+                self.deps_left[u] -= 1
+                if self.deps_left[u] == 0: next_ready.append(u)
+              continue
+            if alu_spare >= 4 and pending_split is None: # 4+4 split demotion
+              current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 4)))
+              slots["alu"] += 4
+              pending_split = i
+              continue  
+
+          next_ready.append(i)
 
       if current: bundles.append(current)
       ready = next_ready
@@ -258,11 +301,12 @@ class VLIWPacker:
     return bundles
 
   def emit(self, bundles):
-    # reg alloc
-    reg, r = 0, {}
+    # reg alloc - find zero constant for ALU moves (VECTORIZE), fallback to reg 0
+    reg, r, zero_reg = 0, {}, 0
     for u in self.uops:
       if u.op not in {Ops.STORE, Ops.SINK, Ops.GEP}:
         r[u] = reg; reg += u.dtype.count
+        if u.op is Ops.CONST and u.arg == 0: zero_reg = r[u]
       elif u.op is Ops.GEP:
         r[u] = r[u.src[0]] + u.arg[0]
 
@@ -275,8 +319,8 @@ class VLIWPacker:
       if op is Ops.CONST: return ("const", r[u], u.arg)
       if op is Ops.VECTORIZE:
         if v == "broadcast": return ("vbroadcast", r[u], r[u.src[0]])
-        s = u.src[v]
-        return None if r[s] == r[u] + v else ("add_imm", r[u] + v, r[s], 0)
+        # v == "moves": emit ALU moves (+ 0), skip if src already in place
+        return [("+", r[u] + lane, r[s], zero_reg) for lane, s in enumerate(u.src) if r[s] != r[u] + lane]
       if op is Ops.LOAD:  return (("vload" if u.dtype.count > 1 else "load"),  r[u], r[u.src[0]])
       if op is Ops.STORE: return (("vstore" if u.src[1].dtype.count > 1 else "store"), r[u.src[0]], r[u.src[1]])
       if op is Ops.MULACC: return ("multiply_add", r[u], r[u.src[0]], r[u.src[1]], r[u.src[2]])
@@ -284,6 +328,12 @@ class VLIWPacker:
       return (self.code_for_op[op], r[u], r[u.src[0]], r[u.src[1]])
 
     result = []
+    # Ensure zero register exists (needed for ALU moves in VECTORIZE)
+    if zero_reg == 0:
+      # Allocate zero register if no CONST(0) exists
+      zero_reg = reg
+      result.append({"load": [("const", zero_reg, 0)]})
+    
     for bundle in bundles:
       out = {}
       for eng, items in bundle.items():
@@ -293,7 +343,9 @@ class VLIWPacker:
 
           if it.elements is None:
             t = emit_base(it.idx)
-            if t is not None: tup.append(t)
+            if t is not None:
+              if isinstance(t, list): tup.extend(t)
+              else: tup.append(t)
           else:
             _, u, _ = self.instructions[it.idx]
             op = self.code_for_op[u.op]  
