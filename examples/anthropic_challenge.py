@@ -96,7 +96,7 @@ class RegisterAllocator:
     self.zero_reg = 0
     self.pinned: set[UOp] = set()
     self.alloc_ops = {Ops.STORE, Ops.SINK, Ops.GEP}
-    
+
     # Pin CONST(0) to zero_reg if it exists
     for u in uops:
       if u.op is Ops.CONST and u.arg == 0:
@@ -109,7 +109,7 @@ class RegisterAllocator:
     if u.op is Ops.GEP:
       return self.get_reg(u.src[0]) + u.arg[0]
     return self.r[u]
-  
+
   def alloc(self, u: UOp):
     if u not in self.alloc_ops and u not in self.r:
       k = u.dtype.count
@@ -168,19 +168,19 @@ class VLIWPacker:
     n = len(self.uops)
     self.users: list[list[int]] = [[] for _ in range(n)]
     self.deps_left: list[int] = [0] * n
-    
+
     for i, u in enumerate(self.uops):
       # SINK and GEP don't produce values
       if u.op is Ops.SINK or u.op is Ops.GEP:
-        if u.op is Ops.GEP: 
+        if u.op is Ops.GEP:
           self.uop_to_idx[u] = self.uop_to_idx.get(u.src[0])
         continue
       for src in u.src:
         if src in self.uop_to_idx:
           pred = self.uop_to_idx[src]
-          self.users[pred].append(i)  
-          self.deps_left[i] += 1  
-    
+          self.users[pred].append(i)
+          self.deps_left[i] += 1
+
     self.depth = self._compute_depth()
     self.batch_ids, self.offsets = self._assign_batches()
 
@@ -194,19 +194,19 @@ class VLIWPacker:
 
   def _assign_batches(self) -> tuple[list[int | None], list[int]]:
     def walk(u: UOp, bi: int):
-        idx = self.uop_to_idx.get(u)
-        if idx is None or visited_by[idx] == bi: return  
-        visited_by[idx] = bi
-        if batch_ids[idx] is None: batch_ids[idx] = bi
-        # shared UOp
-        elif batch_ids[idx] != bi: batch_ids[idx] = None
-        for s in u.src: walk(s, bi)
+      idx = self.uop_to_idx.get(u)
+      if idx is None or visited_by[idx] == bi: return
+      visited_by[idx] = bi
+      if batch_ids[idx] is None: batch_ids[idx] = bi
+      # shared UOp
+      elif batch_ids[idx] != bi: batch_ids[idx] = None
+      for s in u.src: walk(s, bi)
 
     n = len(self.uops)
     batch_ids= [None] * n
     sink = self.uops[-1]
     batch_count = len(sink.src)
-    visited_by = [None] * n  
+    visited_by = [None] * n
     for bi, root in enumerate(sink.src): walk(root, bi)
 
     # stagger batches evenly across the schedule
@@ -224,9 +224,9 @@ class VLIWPacker:
     uop = self.uops[i]
     # vectorize is len(src) ALU moves
     if uop.op is Ops.VECTORIZE:
-      if not all(s == uop.src[0] for s in uop.src):  
+      if not all(s == uop.src[0] for s in uop.src):
         return len(set(uop.src))
-    if uop.op is Ops.MULACC and uop.dtype.count == 1: print("scalar MULACC"); return 2 
+    if uop.op is Ops.MULACC and uop.dtype.count == 1: print("scalar MULACC"); return 2
     return 1
 
   def pack(self):
@@ -244,7 +244,7 @@ class VLIWPacker:
         for u in self.users[pending_split]:
           self.deps_left[u] -= 1
           if self.deps_left[u] == 0: next_ready.append(u)
-        pending_split = None  
+        pending_split = None
 
       # sort by batch and dependency depth
       ready.sort(key=self._priority)
@@ -273,9 +273,9 @@ class VLIWPacker:
             current.setdefault("alu", []).append(ScheduledUOp(i, (0, 4)))
             slots["alu"] += 4
             pending_split = i
-            continue  
+            continue
         # slot limited (leave for next bundles)
-        next_ready.append(i) 
+        next_ready.append(i)
       assert current is not None, "Deadlock while packing"
       bundles.append(current)
       ready = next_ready
