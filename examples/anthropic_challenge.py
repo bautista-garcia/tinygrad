@@ -81,10 +81,9 @@ vliw_prepare = PatternMatcher([
   (UPat(Ops.ADD, src=[UPat(Ops.MUL, src=(UPat(name="a"), UPat(name="b"))), UPat(name="c")]), lambda a, b, c: UOp(Ops.MULACC, a.dtype, (a, b, c))),
 ])+symbolic
 
-@dataclass(frozen=True)
-class ScheduledOp:
+@dataclass
+class ScheduledUOp:
   idx: int
-  engine: str
   elements: tuple[int,int] | None = None
 
 class RegisterAllocator:
@@ -140,114 +139,99 @@ class VLIWPacker:
     self.uops = uops
     self.code_for_op = code_for_op
     self.SLOT_LIMITS = SLOT_LIMITS
-    self.instructions: list[tuple] = []  # (engine, uop, variant)
     self.users: list[list[int]] = []
     self.deps_left: list[int] = []
-    self.def_instr: dict[UOp, list[int]] = {}  # maps uop -> list of instruction indices it produces
+    self.uop_to_idx: dict[UOp, int] = {}
     self.build_deps()
-    # self.batch_id = self.assign_batch_ids()
-    # self.depth = self.compute_depth()
-    # self.offsets = self.compute_offsets()
+
+
+  def _get_engine(self, u: UOp) -> str:
+    """Determine engine for a UOp."""
+    if u.op is Ops.CONST:
+      return "load"
+    if u.op is Ops.VECTORIZE:
+      return "valu" if all(s == u.src[0] for s in u.src) else "alu"
+    if u.op is Ops.LOAD:
+      return "load"
+    if u.op is Ops.STORE:
+      return "store"
+    if u.op is Ops.MULACC:
+      return "valu"
+    if u.op is Ops.WHERE:
+      return "flow"
+    if u.op in self.code_for_op:
+      return "valu" if u.dtype.count > 1 else "alu"
+    raise NotImplementedError(f"unhandled op {u.op}")
 
   def build_deps(self):
-    def add(engine: str, uop: UOp, variant, src_uops: list[UOp]):
-      i = len(self.instructions)
-      self.instructions.append((engine, uop, variant))
-      self.users.append([])
-      self.deps_left.append(0)
-      for s in src_uops:
-        for pred in self.def_instr.get(s, []):
-          self.users[pred].append(i)
-          self.deps_left[i] += 1
-      return i
-
-    for u in self.uops:
-      if u.op is Ops.SINK: continue
-      if u.op is Ops.GEP:
-        self.def_instr[u] = self.def_instr.get(u.src[0], [])
+    self.uop_to_idx = {u: i for i, u in enumerate(self.uops)}
+    n = len(self.uops)
+    self.users: list[list[int]] = [[] for _ in range(n)]
+    self.deps_left: list[int] = [0] * n
+    
+    for i, u in enumerate(self.uops):
+      # SINK and GEP don't produce values
+      if u.op is Ops.SINK or u.op is Ops.GEP:
+        if u.op is Ops.GEP: 
+          self.uop_to_idx[u] = self.uop_to_idx.get(u.src[0])
         continue
-      match u.op:
-        case Ops.CONST:
-          self.def_instr[u] = [add("load", u, None, [])]
-        case Ops.VECTORIZE:
-          if all(s == u.src[0] for s in u.src):
-            self.def_instr[u] = [add("valu", u, "broadcast", [u.src[0]])]
-          else:
-            # Non-broadcast VECTORIZE: ALU moves
-            self.def_instr[u] = [add("alu", u, "moves", list(u.src))]
-        case Ops.LOAD:
-          self.def_instr[u] = [add("load", u, None, [u.src[0]])]
-        case Ops.STORE:
-          add("store", u, None, list(u.src[:2]))
-        case Ops.MULACC:
-          self.def_instr[u] = [add("valu", u, None, list(u.src))]
-        case Ops.WHERE:
-          self.def_instr[u] = [add("flow", u, None, list(u.src))]
-        case _ if u.op in self.code_for_op:
-          engine = "valu" if u.dtype.count > 1 else "alu"
-          self.def_instr[u] = [add(engine, u, None, list(u.src))]
-        case _:
-          raise NotImplementedError(f"unhandled op {u.op}")
-
-    # Build uop_to_idx mapping for batch assignment
-    self.uop_to_idx: dict[UOp, int] = {}
-    for idx, (_, uop, _) in enumerate(self.instructions):
-      if uop not in self.uop_to_idx:
-        self.uop_to_idx[uop] = idx
-
-    # Compute depth, batch_ids, and offsets
+      for src in u.src:
+        if src in self.uop_to_idx:
+          pred = self.uop_to_idx[src]
+          self.users[pred].append(i)  
+          self.deps_left[i] += 1  
+    
     self.depth = self._compute_depth()
     self.batch_ids, self.offsets = self._assign_batches()
 
   def _compute_depth(self) -> list[int]:
-    n = len(self.instructions)
+    n = len(self.uops)
     depth = [0] * n
-    for u, idx in self.def_instr.items():
+    for u, idx in self.uop_to_idx.items():
       if u.src:
-        depth[idx[0]] = 1 + max(depth[self.uop_to_idx.get(d, 0)] for d in u.src)
+        depth[idx] = 1 + max(depth[self.uop_to_idx.get(d, 0)] for d in u.src)
     return depth
 
   def _assign_batches(self) -> tuple[list[int | None], list[int]]:
-    n = len(self.instructions)
-    batch_ids: list[int | None] = [None] * n
-    sink = self.uops[-1]
-    assert sink.op is Ops.SINK
-    batch_count = len(sink.src)
-
-    if batch_count > 1:
-      # visited_by[i] = which batch last visited instruction i
-      visited_by: list[int | None] = [None] * n
-      def walk(u: UOp, bi: int):
+    def walk(u: UOp, bi: int):
         idx = self.uop_to_idx.get(u)
-        if idx is None: return
-        if visited_by[idx] == bi: return  # already visited by this batch
+        if idx is None or visited_by[idx] == bi: return  
         visited_by[idx] = bi
         if batch_ids[idx] is None: batch_ids[idx] = bi
-        elif batch_ids[idx] != bi: batch_ids[idx] = None  # shared across batches
+        # shared UOp
+        elif batch_ids[idx] != bi: batch_ids[idx] = None
         for s in u.src: walk(s, bi)
-      for bi, root in enumerate(sink.src): walk(root, bi)
+
+    n = len(self.uops)
+    batch_ids= [None] * n
+    sink = self.uops[-1]
+    batch_count = len(sink.src)
+    visited_by = [None] * n  
+    for bi, root in enumerate(sink.src): walk(root, bi)
 
     # stagger batches evenly across the schedule
     schedule_length = max(self.depth) + 1 if self.depth else 1
-    spacing = schedule_length // batch_count if batch_count > 0 else 1
+    spacing = schedule_length // batch_count
     offsets = [(bi * spacing) % schedule_length for bi in range(batch_count)]
     return batch_ids, offsets
 
   def _priority(self, i: int) -> int:
     bid = self.batch_ids[i]
-    # shared instructions (bid=None) get offset 0, so they're scheduled first
+    # start scheduling with low depth and initial batches
     return self.depth[i] + (self.offsets[bid] if bid is not None else 0)
 
   def _slot_count(self, i: int) -> int:
-    _, uop, variant = self.instructions[i]
-    # Non-broadcast VECTORIZE costs = number of unique scalar sources (ALU moves)
-    if uop.op is Ops.VECTORIZE and variant == "moves": return len(set(uop.src))
+    uop = self.uops[i]
+    # vectorize is len(src) ALU moves
+    if uop.op is Ops.VECTORIZE:
+      if not all(s == uop.src[0] for s in uop.src):  
+        return len(set(uop.src))
     if uop.op is Ops.MULACC and uop.dtype.count == 1: print("scalar MULACC"); return 2 
     return 1
 
   def pack(self):
-    n = len(self.instructions)
-    ready = [i for i in range(n) if self.deps_left[i] == 0]
+    n = len(self.uops)
+    ready = [i for i in range(n) if self.deps_left[i] == 0 and self.uops[i].op not in {Ops.SINK, Ops.GEP}]
     bundles = [] # engine : list of scheduled ops (cycle i)
     pending_split = None # instruction pending (4, 8) scheduling
 
@@ -255,7 +239,7 @@ class VLIWPacker:
       current, slots, next_ready = {}, {e: 0 for e in self.SLOT_LIMITS}, []
       # finish pending split first (4, 8)
       if pending_split is not None:
-        current.setdefault("alu", []).append(ScheduledOp(pending_split, "alu", (4, 8)))
+        current.setdefault("alu", []).append(ScheduledUOp(pending_split, (4, 8)))
         slots["alu"] += 4
         for u in self.users[pending_split]:
           self.deps_left[u] -= 1
@@ -265,10 +249,11 @@ class VLIWPacker:
       # sort by batch and dependency depth
       ready.sort(key=self._priority)
       for i in ready:
-        eng, u, _ = self.instructions[i]
+        u = self.uops[i]
+        eng = self._get_engine(u)
         cost = self._slot_count(i)
         if slots[eng] + cost <= self.SLOT_LIMITS[eng]:
-          current.setdefault(eng, []).append(ScheduledOp(i, eng, None))
+          current.setdefault(eng, []).append(ScheduledUOp(i, None))
           slots[eng] += cost
           for u in self.users[i]:
             self.deps_left[u] -= 1
@@ -278,14 +263,14 @@ class VLIWPacker:
         if eng == "valu" and u.op in self.DEMOTABLE and u.dtype.count == 8:
           alu_spare = self.SLOT_LIMITS["alu"] - slots["alu"]
           if alu_spare >= 8: # 8 wide demotion
-            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 8)))
+            current.setdefault("alu", []).append(ScheduledUOp(i, (0, 8)))
             slots["alu"] += 8
             for u in self.users[i]:
               self.deps_left[u] -= 1
               if self.deps_left[u] == 0: next_ready.append(u)
             continue
           if alu_spare >= 4 and pending_split is None: # 4+4 split demotion
-            current.setdefault("alu", []).append(ScheduledOp(i, "alu", (0, 4)))
+            current.setdefault("alu", []).append(ScheduledUOp(i, (0, 4)))
             slots["alu"] += 4
             pending_split = i
             continue  
@@ -300,23 +285,13 @@ class VLIWPacker:
   def emit(self, bundles):
     ra = RegisterAllocator(self.uops)
 
-    # Build use counts from scheduled occurrences
-    for bundle in bundles:
-      for eng, items in bundle.items():
-        for it in items:
-          _, u, v = self.instructions[it.idx]
-          if u.op is Ops.VECTORIZE and v == "broadcast":
-            ra.use(u.src[0], True)
-          else:
-            for s in u.src:
-              ra.use(s, True)
-
     # Emit helper for base (non-sliced)
     def emit_base(i: int, elements: tuple[int, int] | None = None):
-      _, u, v = self.instructions[i]
+      u = self.uops[i]
       op = u.op
+      v = "broadcast" if u.op is Ops.VECTORIZE and all(s == u.src[0] for s in u.src) else "moves"
 
-      # Handle demoted emission (sliced per-lane)
+      # demoted emission
       if elements is not None:
         lo, hi = elements
         op2 = self.code_for_op[u.op]
@@ -358,9 +333,18 @@ class VLIWPacker:
 
       return (self.code_for_op[op], ra.get_reg(u), ra.get_reg(u.src[0]), ra.get_reg(u.src[1]))
 
-    result = []
+    # Build use counts from scheduled occurrences
+    for bundle in bundles:
+      for eng, items in bundle.items():
+        for it in items:
+          u = self.uops[it.idx]
+          if u.op is Ops.VECTORIZE and all(s == u.src[0] for s in u.src):
+            ra.use(u.src[0], inc=True)
+          else:
+            for s in u.src:
+              ra.use(s, inc=True)
 
-    # load zero register for ALU moves
+    result = []
     result.append({"load": [("const", ra.zero_reg, 0)]})
 
     # Main emission loop (bundle-safe freeing)
@@ -369,18 +353,15 @@ class VLIWPacker:
       for eng, items in bundle.items():
         tup = []
         for it in items:
-          _, u, v = self.instructions[it.idx]
-
-          # Allocate register
+          u = self.uops[it.idx]
           ra.alloc(u)
 
-          # Decrement uses as we process each instruction
-          if u.op is Ops.VECTORIZE and v == "broadcast":
-            ra.use(u.src[0], False)
+          if u.op is Ops.VECTORIZE and all(s == u.src[0] for s in u.src):
+            ra.use(u.src[0], inc=False)
           else:
             for s in u.src:
-              ra.use(s, False)
-              
+              ra.use(s, inc=False)
+
           # emit instruction
           tup.extend(t if isinstance(t:=emit_base(it.idx, it.elements), list) else [t])
         out[eng] = tup
@@ -394,8 +375,6 @@ class VLIWPacker:
 
     result.append({"flow": [("halt",)]})
     return repr(result)
-
-
 
 class VLIWRenderer(Renderer):
   has_local = False  # TODO: this should be the default / cleaned up
